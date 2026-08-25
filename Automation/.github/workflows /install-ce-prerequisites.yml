@@ -1,0 +1,1124 @@
+```yaml
+name: Install CE Prerequisites
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment_name:
+        description: "Enter Power Platform Environment Name"
+        required: true
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+
+  install-applications:
+
+    runs-on: ubuntu-latest
+
+    steps:
+
+      # =========================================================
+      # 1. Checkout Repository
+      # =========================================================
+
+      - name: Checkout Repository
+        uses: actions/checkout@v6
+
+
+      # =========================================================
+      # 2. Install jq
+      # =========================================================
+
+      - name: Install jq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+
+      # =========================================================
+      # 3. Azure Login using GitHub OIDC
+      # =========================================================
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.CLIENT_ID }}
+          tenant-id: ${{ secrets.PP_TENANT_ID }}
+          allow-no-subscriptions: true
+
+
+      # =========================================================
+      # 4. Get Power Platform API Token
+      # =========================================================
+
+      - name: Get Power Platform API Token
+        shell: bash
+        run: |
+
+          echo "Getting Power Platform API access token..."
+
+          TOKEN=$(az account get-access-token \
+            --resource https://api.powerplatform.com \
+            --query accessToken \
+            --output tsv)
+
+          if [ -z "$TOKEN" ]; then
+            echo "ERROR: Failed to obtain Power Platform API token."
+            exit 1
+          fi
+
+          echo "Power Platform API token acquired."
+
+          echo "PP_API_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+
+
+      # =========================================================
+      # 5. Validate JSON File
+      # =========================================================
+
+      - name: Validate CE Prerequisites JSON
+        shell: bash
+        run: |
+
+          JSON_FILE="$GITHUB_WORKSPACE/ce-prerequisites.json"
+
+          echo "=========================================="
+          echo "Validating CE Prerequisites JSON"
+          echo "=========================================="
+
+          echo "JSON file:"
+          echo "$JSON_FILE"
+
+
+          # -----------------------------------------------------
+          # Check file
+          # -----------------------------------------------------
+
+          if [ ! -f "$JSON_FILE" ]; then
+
+            echo "ERROR: ce-prerequisites.json not found."
+
+            echo ""
+            echo "Repository contents:"
+
+            find "$GITHUB_WORKSPACE" \
+              -maxdepth 3 \
+              -type f \
+              | sort
+
+            exit 1
+
+          fi
+
+
+          # -----------------------------------------------------
+          # Validate JSON syntax
+          # -----------------------------------------------------
+
+          if ! jq empty "$JSON_FILE"; then
+
+            echo "ERROR: Invalid JSON syntax."
+
+            exit 1
+
+          fi
+
+
+          # -----------------------------------------------------
+          # Root must be array
+          # -----------------------------------------------------
+
+          if ! jq -e 'type == "array"' "$JSON_FILE" > /dev/null; then
+
+            echo "ERROR: JSON root must be an array."
+
+            exit 1
+
+          fi
+
+
+          # -----------------------------------------------------
+          # Validate required fields
+          # -----------------------------------------------------
+
+          INVALID_COUNT=$(jq '
+            [
+              .[]
+              | select(
+                  (.FriendlyName == null or .FriendlyName == "") or
+                  (.ApplicationId == null or .ApplicationId == "") or
+                  (.UniqueName == null or .UniqueName == "")
+                )
+            ]
+            | length
+          ' "$JSON_FILE")
+
+
+          if [ "$INVALID_COUNT" -gt 0 ]; then
+
+            echo "ERROR: Invalid application entries found."
+
+            jq '
+              .[]
+              | select(
+                  (.FriendlyName == null or .FriendlyName == "") or
+                  (.ApplicationId == null or .ApplicationId == "") or
+                  (.UniqueName == null or .UniqueName == "")
+                )
+            ' "$JSON_FILE"
+
+            exit 1
+
+          fi
+
+
+          echo ""
+          echo "Configured applications:"
+          echo ""
+
+          jq -r '
+            .[]
+            | "\(.FriendlyName) | \(.UniqueName)"
+          ' "$JSON_FILE"
+
+
+          echo ""
+          echo "JSON validation successful."
+
+
+      # =========================================================
+      # 6. Resolve Environment ID
+      # =========================================================
+
+      - name: Resolve Environment ID
+        id: resolve-env
+        shell: bash
+        run: |
+
+          ENV_NAME="${{ inputs.environment_name }}"
+
+          echo "=========================================="
+          echo "Resolving Power Platform Environment"
+          echo "=========================================="
+
+          echo "Environment Name:"
+          echo "$ENV_NAME"
+
+
+          ENV_NAME_LC=$(echo "$ENV_NAME" | tr '[:upper:]' '[:lower:]')
+
+
+          # -----------------------------------------------------
+          # Get environments
+          # -----------------------------------------------------
+
+          HTTP_CODE=$(curl -sS \
+            -o "$RUNNER_TEMP/environments.json" \
+            -w "%{http_code}" \
+            -X GET \
+            -H "Authorization: Bearer $PP_API_TOKEN" \
+            -H "Accept: application/json" \
+            "https://api.powerplatform.com/environmentmanagement/environments?api-version=2024-10-01")
+
+
+          echo "Environment API HTTP Status: $HTTP_CODE"
+
+
+          if [ "$HTTP_CODE" != "200" ]; then
+
+            echo "ERROR: Unable to retrieve environments."
+
+            cat "$RUNNER_TEMP/environments.json"
+
+            exit 1
+
+          fi
+
+
+          # -----------------------------------------------------
+          # Find environment
+          # -----------------------------------------------------
+
+          ENV_ID=$(jq -r \
+            --arg ENV_NAME_LC "$ENV_NAME_LC" '
+
+            (
+              if type == "array" then
+                .
+              elif type == "object" and has("value") then
+                .value
+              else
+                []
+              end
+            )
+
+            | map(
+                select(
+                  (
+                    (.displayName // .DisplayName // .name // .Name // "")
+                    | ascii_downcase
+                  ) == $ENV_NAME_LC
+                )
+              )
+
+            | .[0]
+
+            | (
+                .environmentId //
+                .EnvironmentId //
+                .id //
+                .Id //
+                empty
+              )
+
+          ' "$RUNNER_TEMP/environments.json")
+
+
+          # -----------------------------------------------------
+          # Environment not found
+          # -----------------------------------------------------
+
+          if [ -z "$ENV_ID" ] || [ "$ENV_ID" = "null" ]; then
+
+            echo "ERROR: Environment not found."
+
+            echo ""
+            echo "Requested environment:"
+            echo "$ENV_NAME"
+
+            echo ""
+            echo "Available environments:"
+
+            jq -r '
+              (
+                if type == "array" then
+                  .
+                elif type == "object" and has("value") then
+                  .value
+                else
+                  []
+                end
+              )
+              | .[]
+              | "\(
+                  .displayName //
+                  .DisplayName //
+                  .name //
+                  .Name
+                )
+                |
+                \(
+                  .environmentId //
+                  .EnvironmentId //
+                  .id //
+                  .Id
+                )"
+            ' "$RUNNER_TEMP/environments.json"
+
+            exit 1
+
+          fi
+
+
+          echo ""
+          echo "Environment resolved successfully."
+          echo "Environment ID: $ENV_ID"
+
+
+          echo "environment_id=$ENV_ID" >> "$GITHUB_OUTPUT"
+
+
+      # =========================================================
+      # 7. Get Current Application Package Status
+      #
+      # This is the important NEW step.
+      #
+      # Before installation we retrieve the applications that
+      # are already installed in the environment.
+      # =========================================================
+
+      - name: Get Installed CE Applications
+        id: installed-apps
+        shell: bash
+        run: |
+
+          ENV_ID="${{ steps.resolve-env.outputs.environment_id }}"
+
+          echo "=========================================="
+          echo "Getting Existing CE Applications"
+          echo "=========================================="
+
+          APPLICATIONS_URL="https://api.powerplatform.com/appmanagement/environments/${ENV_ID}/applicationPackages?api-version=2024-10-01"
+
+
+          HTTP_CODE=$(curl -sS \
+            -o "$RUNNER_TEMP/installed-applications.json" \
+            -w "%{http_code}" \
+            -X GET \
+            -H "Authorization: Bearer $PP_API_TOKEN" \
+            -H "Accept: application/json" \
+            "$APPLICATIONS_URL")
+
+
+          echo "Application API HTTP Status: $HTTP_CODE"
+
+
+          if [ "$HTTP_CODE" != "200" ]; then
+
+            echo "ERROR: Unable to retrieve application packages."
+
+            cat "$RUNNER_TEMP/installed-applications.json"
+
+            exit 1
+
+          fi
+
+
+          echo ""
+          echo "Current application packages:"
+
+          jq -r '
+            .value[]?
+            |
+            "\(
+              .uniqueName //
+              .UniqueName //
+              .name //
+              .Name //
+              "Unknown"
+            )
+            |
+            State:
+            \(
+              .state //
+              .State //
+              .status //
+              .Status //
+              "Unknown"
+            )"
+          ' "$RUNNER_TEMP/installed-applications.json"
+
+
+          echo ""
+          echo "Application package information retrieved successfully."
+
+
+      # =========================================================
+      # 8. Install Applications
+      #
+      # Behavior:
+      #
+      # Already Installed → SKIP
+      #
+      # Not Installed → INSTALL
+      #
+      # Failed → Record FAILED and continue
+      #
+      # =========================================================
+
+      - name: Install CE Applications
+        shell: bash
+        run: |
+
+          ENV_ID="${{ steps.resolve-env.outputs.environment_id }}"
+
+          JSON_FILE="$GITHUB_WORKSPACE/ce-prerequisites.json"
+
+          INSTALLED_FILE="$RUNNER_TEMP/installed-applications.json"
+
+          RESULT_FILE="$RUNNER_TEMP/ce-install-results.txt"
+
+
+          rm -f "$RESULT_FILE"
+
+          touch "$RESULT_FILE"
+
+
+          # -----------------------------------------------------
+          # Counters
+          # -----------------------------------------------------
+
+          TOTAL=0
+          INSTALLED=0
+          SKIPPED=0
+          FAILED=0
+
+
+          echo "=========================================="
+          echo "CE APPLICATION INSTALLATION"
+          echo "=========================================="
+
+          echo "Environment ID:"
+          echo "$ENV_ID"
+
+          echo ""
+
+
+          # =====================================================
+          # Process every configured application
+          # =====================================================
+
+          while IFS= read -r APP
+          do
+
+            TOTAL=$((TOTAL + 1))
+
+
+            # ---------------------------------------------------
+            # Read JSON values
+            # ---------------------------------------------------
+
+            FRIENDLY_NAME=$(echo "$APP" | jq -r '.FriendlyName')
+
+            APPLICATION_ID=$(echo "$APP" | jq -r '.ApplicationId')
+
+            UNIQUE_NAME=$(echo "$APP" | jq -r '.UniqueName')
+
+
+            echo ""
+            echo "=========================================="
+            echo "Application #$TOTAL"
+            echo "=========================================="
+
+            echo "Friendly Name : $FRIENDLY_NAME"
+            echo "Application ID: $APPLICATION_ID"
+            echo "Unique Name   : $UNIQUE_NAME"
+
+
+            START_TIME=$(date +%s)
+
+
+            # ===================================================
+            # Check if application is already installed
+            # ===================================================
+
+            CURRENT_STATE=$(jq -r \
+              --arg UNIQUE_NAME "$UNIQUE_NAME" '
+
+              (
+                .value //
+                .
+              )
+
+              | map(
+                  select(
+                    (
+                      .uniqueName //
+                      .UniqueName //
+                      .name //
+                      .Name //
+                      ""
+                    ) == $UNIQUE_NAME
+                  )
+                )
+
+              | .[0]
+
+              | (
+                  .state //
+                  .State //
+                  .status //
+                  .Status //
+                  empty
+                )
+
+            ' "$INSTALLED_FILE")
+
+
+            echo ""
+            echo "Current application state:"
+            echo "${CURRENT_STATE:-Not Found}"
+
+
+            # ===================================================
+            # ALREADY INSTALLED
+            # ===================================================
+
+            if [[ "$CURRENT_STATE" =~ ^(Installed|installed|Succeeded|succeeded)$ ]]; then
+
+              echo ""
+              echo "⏭️ SKIPPED: Application already installed."
+
+              SKIPPED=$((SKIPPED + 1))
+
+
+              END_TIME=$(date +%s)
+
+              DURATION=$((END_TIME - START_TIME))
+
+
+              MINUTES=$((DURATION / 60))
+
+              SECONDS_REMAINING=$((DURATION % 60))
+
+              DURATION_DISPLAY="${MINUTES}m ${SECONDS_REMAINING}s"
+
+
+              echo "$FRIENDLY_NAME|$UNIQUE_NAME|$APPLICATION_ID|SKIPPED|-|-|$DURATION_DISPLAY|Already installed" \
+                >> "$RESULT_FILE"
+
+
+              continue
+
+            fi
+
+
+            # ===================================================
+            # Validate Unique Name
+            # ===================================================
+
+            if [ -z "$UNIQUE_NAME" ] ||
+               [ "$UNIQUE_NAME" = "null" ]; then
+
+              echo "ERROR: Unique Name is missing."
+
+              FAILED=$((FAILED + 1))
+
+
+              echo "$FRIENDLY_NAME|$UNIQUE_NAME|$APPLICATION_ID|FAILED|-|-|0m 0s|Unique Name is missing" \
+                >> "$RESULT_FILE"
+
+
+              continue
+
+            fi
+
+
+            # ===================================================
+            # Create Installation URL
+            # ===================================================
+
+            INSTALL_URL="https://api.powerplatform.com/appmanagement/environments/${ENV_ID}/applicationPackages/${UNIQUE_NAME}/install?api-version=2024-10-01"
+
+
+            echo ""
+            echo "Application is not installed."
+            echo "Starting installation..."
+
+            echo "Installation URL:"
+            echo "$INSTALL_URL"
+
+
+            # ===================================================
+            # Start installation
+            # ===================================================
+
+            RESPONSE_FILE=$(mktemp)
+
+
+            HTTP_CODE=$(curl -sS \
+              -o "$RESPONSE_FILE" \
+              -w "%{http_code}" \
+              -X POST \
+              -H "Authorization: Bearer $PP_API_TOKEN" \
+              -H "Content-Type: application/json" \
+              -H "Accept: application/json" \
+              "$INSTALL_URL")
+
+
+            echo ""
+            echo "Installation HTTP Status: $HTTP_CODE"
+
+
+            echo ""
+            echo "Installation API Response:"
+
+            cat "$RESPONSE_FILE"
+
+
+            # ===================================================
+            # Installation request failed
+            # ===================================================
+
+            if [[ "$HTTP_CODE" != "200" && "$HTTP_CODE" != "202" ]]; then
+
+              echo ""
+              echo "❌ Installation request failed."
+
+
+              ERROR_MESSAGE=$(jq -r '
+                .error.message //
+                .message //
+                "Installation request failed"
+              ' "$RESPONSE_FILE" 2>/dev/null || true)
+
+
+              if [ -z "$ERROR_MESSAGE" ] ||
+                 [ "$ERROR_MESSAGE" = "null" ]; then
+
+                ERROR_MESSAGE="HTTP $HTTP_CODE"
+
+              fi
+
+
+              echo "Error:"
+              echo "$ERROR_MESSAGE"
+
+
+              FAILED=$((FAILED + 1))
+
+
+              END_TIME=$(date +%s)
+
+              DURATION=$((END_TIME - START_TIME))
+
+              MINUTES=$((DURATION / 60))
+
+              SECONDS_REMAINING=$((DURATION % 60))
+
+              DURATION_DISPLAY="${MINUTES}m ${SECONDS_REMAINING}s"
+
+
+              echo "$FRIENDLY_NAME|$UNIQUE_NAME|$APPLICATION_ID|FAILED|$HTTP_CODE|-|$DURATION_DISPLAY|$ERROR_MESSAGE" \
+                >> "$RESULT_FILE"
+
+
+              rm -f "$RESPONSE_FILE"
+
+
+              # IMPORTANT:
+              # Continue to next application
+
+              continue
+
+            fi
+
+
+            # ===================================================
+            # Get Operation ID
+            # ===================================================
+
+            OPERATION_ID=$(jq -r '
+              .lastOperation.operationId //
+              .operationId //
+              .id //
+              empty
+            ' "$RESPONSE_FILE")
+
+
+            rm -f "$RESPONSE_FILE"
+
+
+            if [ -z "$OPERATION_ID" ] ||
+               [ "$OPERATION_ID" = "null" ]; then
+
+              echo ""
+              echo "❌ Operation ID was not returned."
+
+
+              FAILED=$((FAILED + 1))
+
+
+              echo "$FRIENDLY_NAME|$UNIQUE_NAME|$APPLICATION_ID|FAILED|$HTTP_CODE|-|0m 0s|Operation ID was not returned" \
+                >> "$RESULT_FILE"
+
+
+              continue
+
+            fi
+
+
+            echo ""
+            echo "Operation ID:"
+            echo "$OPERATION_ID"
+
+
+            # ===================================================
+            # Poll Installation Status
+            # ===================================================
+
+            MAX_ATTEMPTS=30
+
+            ATTEMPT=1
+
+            INSTALL_SUCCESS=false
+
+            FINAL_MESSAGE=""
+
+
+            while [ "$ATTEMPT" -le "$MAX_ATTEMPTS" ]
+            do
+
+              echo ""
+              echo "------------------------------------------"
+              echo "Checking installation status"
+              echo "Attempt $ATTEMPT of $MAX_ATTEMPTS"
+              echo "------------------------------------------"
+
+
+              STATUS_URL="https://api.powerplatform.com/appmanagement/environments/${ENV_ID}/operations/${OPERATION_ID}?api-version=2024-10-01"
+
+
+              STATUS_FILE=$(mktemp)
+
+
+              STATUS_HTTP=$(curl -sS \
+                -o "$STATUS_FILE" \
+                -w "%{http_code}" \
+                -X GET \
+                -H "Authorization: Bearer $PP_API_TOKEN" \
+                -H "Accept: application/json" \
+                "$STATUS_URL")
+
+
+              echo "Status HTTP: $STATUS_HTTP"
+
+
+              # -------------------------------------------------
+              # Status API failure
+              # -------------------------------------------------
+
+              if [ "$STATUS_HTTP" != "200" ]; then
+
+                echo "WARNING: Unable to retrieve installation status."
+
+                cat "$STATUS_FILE"
+
+                rm -f "$STATUS_FILE"
+
+                ATTEMPT=$((ATTEMPT + 1))
+
+                sleep 60
+
+                continue
+
+              fi
+
+
+              # -------------------------------------------------
+              # Read state
+              # -------------------------------------------------
+
+              STATE=$(jq -r '
+                .state //
+                .lastOperation.state //
+                .status //
+                empty
+              ' "$STATUS_FILE")
+
+
+              STATUS_MESSAGE=$(jq -r '
+                .statusMessage //
+                .lastOperation.statusMessage //
+                .message //
+                empty
+              ' "$STATUS_FILE")
+
+
+              echo "State: $STATE"
+
+
+              if [ -n "$STATUS_MESSAGE" ] &&
+                 [ "$STATUS_MESSAGE" != "null" ]; then
+
+                echo "Message: $STATUS_MESSAGE"
+
+              fi
+
+
+              rm -f "$STATUS_FILE"
+
+
+              # =================================================
+              # SUCCESS
+              # =================================================
+
+              if [[ "$STATE" =~ ^(Installed|installed|Succeeded|succeeded)$ ]]; then
+
+                echo ""
+                echo "✅ SUCCESS: $FRIENDLY_NAME installed successfully."
+
+
+                INSTALL_SUCCESS=true
+
+                FINAL_MESSAGE="Installation completed successfully"
+
+
+                break
+
+              fi
+
+
+              # =================================================
+              # FAILURE
+              # =================================================
+
+              if [[ "$STATE" =~ ^(InstallFailed|Failed|failed|Error|error)$ ]]; then
+
+                echo ""
+                echo "❌ FAILED: $FRIENDLY_NAME"
+
+
+                INSTALL_SUCCESS=false
+
+
+                if [ -n "$STATUS_MESSAGE" ] &&
+                   [ "$STATUS_MESSAGE" != "null" ]; then
+
+                  FINAL_MESSAGE="$STATUS_MESSAGE"
+
+                else
+
+                  FINAL_MESSAGE="Application installation failed"
+
+                fi
+
+
+                break
+
+              fi
+
+
+              # =================================================
+              # Still running
+              # =================================================
+
+              echo "⏳ Installation still in progress..."
+
+              ATTEMPT=$((ATTEMPT + 1))
+
+
+              if [ "$ATTEMPT" -le "$MAX_ATTEMPTS" ]; then
+
+                echo "Waiting 60 seconds..."
+
+                sleep 60
+
+              fi
+
+            done
+
+
+            # ===================================================
+            # Timeout
+            # ===================================================
+
+            if [ "$INSTALL_SUCCESS" = false ] &&
+               [ -z "$FINAL_MESSAGE" ]; then
+
+              FINAL_MESSAGE="Installation timed out after $MAX_ATTEMPTS attempts"
+
+            fi
+
+
+            # ===================================================
+            # Calculate duration
+            # ===================================================
+
+            END_TIME=$(date +%s)
+
+            DURATION=$((END_TIME - START_TIME))
+
+
+            MINUTES=$((DURATION / 60))
+
+            SECONDS_REMAINING=$((DURATION % 60))
+
+            DURATION_DISPLAY="${MINUTES}m ${SECONDS_REMAINING}s"
+
+
+            # ===================================================
+            # Save result
+            # ===================================================
+
+            if [ "$INSTALL_SUCCESS" = true ]; then
+
+              INSTALLED=$((INSTALLED + 1))
+
+
+              echo "$FRIENDLY_NAME|$UNIQUE_NAME|$APPLICATION_ID|SUCCESS|$HTTP_CODE|$OPERATION_ID|$DURATION_DISPLAY|$FINAL_MESSAGE" \
+                >> "$RESULT_FILE"
+
+            else
+
+              FAILED=$((FAILED + 1))
+
+
+              echo "$FRIENDLY_NAME|$UNIQUE_NAME|$APPLICATION_ID|FAILED|$HTTP_CODE|$OPERATION_ID|$DURATION_DISPLAY|$FINAL_MESSAGE" \
+                >> "$RESULT_FILE"
+
+            fi
+
+
+          done < <(jq -c '.[]' "$JSON_FILE")
+
+
+          # =====================================================
+          # GitHub Actions Summary
+          # =====================================================
+
+          {
+
+            echo "# 🚀 CE Application Installation Summary"
+
+            echo ""
+
+            echo "## Environment"
+
+            echo ""
+
+            echo "| Property | Value |"
+
+            echo "|---|---|"
+
+            echo "| Environment ID | \`$ENV_ID\` |"
+
+            echo "| Total Applications | **$TOTAL** |"
+
+            echo "| Installed This Run | **$INSTALLED** |"
+
+            echo "| Already Installed / Skipped | **$SKIPPED** |"
+
+            echo "| Failed | **$FAILED** |"
+
+            echo ""
+
+
+            echo "## Installation Results"
+
+            echo ""
+
+            echo "| # | Application | Unique Name | Status | HTTP | Duration | Message |"
+
+            echo "|---:|---|---|---|---:|---:|---|"
+
+
+            COUNT=0
+
+
+            while IFS='|' read -r \
+              NAME \
+              UNIQUE \
+              APP_ID \
+              STATUS \
+              HTTP \
+              OPERATION \
+              DURATION \
+              MESSAGE
+
+            do
+
+              COUNT=$((COUNT + 1))
+
+
+              case "$STATUS" in
+
+                SUCCESS)
+                  STATUS_ICON="✅ SUCCESS"
+                  ;;
+
+                SKIPPED)
+                  STATUS_ICON="⏭️ SKIPPED"
+                  ;;
+
+                FAILED)
+                  STATUS_ICON="❌ FAILED"
+                  ;;
+
+                *)
+                  STATUS_ICON="$STATUS"
+                  ;;
+
+              esac
+
+
+              NAME=$(echo "$NAME" | sed 's/|/\\|/g')
+
+              UNIQUE=$(echo "$UNIQUE" | sed 's/|/\\|/g')
+
+              MESSAGE=$(echo "$MESSAGE" | sed 's/|/\\|/g')
+
+
+              echo "| $COUNT | $NAME | \`$UNIQUE\` | $STATUS_ICON | $HTTP | $DURATION | $MESSAGE |"
+
+
+            done < "$RESULT_FILE"
+
+
+            echo ""
+
+
+            # ===================================================
+            # Final Result
+            # ===================================================
+
+            if [ "$FAILED" -gt 0 ]; then
+
+              echo "## ⚠️ Final Result"
+
+              echo ""
+
+              echo "**$FAILED application(s) failed. Please review the failed applications and run the workflow again.**"
+
+            else
+
+              echo "## ✅ Final Result"
+
+              echo ""
+
+              echo "**All required CE applications are installed.**"
+
+            fi
+
+          } >> "$GITHUB_STEP_SUMMARY"
+
+
+          # =====================================================
+          # Console Summary
+          # =====================================================
+
+          echo ""
+
+          echo "=========================================="
+
+          echo "FINAL INSTALLATION RESULT"
+
+          echo "=========================================="
+
+          echo "Total Applications       : $TOTAL"
+
+          echo "Installed This Run      : $INSTALLED"
+
+          echo "Already Installed       : $SKIPPED"
+
+          echo "Failed                  : $FAILED"
+
+          echo "=========================================="
+
+
+          echo ""
+
+          echo "Detailed Results:"
+
+          cat "$RESULT_FILE"
+
+
+          # =====================================================
+          # Final Job Status
+          # =====================================================
+
+          if [ "$FAILED" -gt 0 ]; then
+
+            echo ""
+
+            echo "ERROR: $FAILED application(s) failed."
+
+            echo "All applications were processed."
+
+            exit 1
+
+          fi
+
+
+          echo ""
+
+          echo "=========================================="
+
+          echo "ALL CE APPLICATIONS ARE INSTALLED"
+
+          echo "=========================================="
+```
