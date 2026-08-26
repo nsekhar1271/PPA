@@ -1,0 +1,82 @@
+name: Delete UDE Environment in PPAC
+on:
+  workflow_dispatch:
+    inputs:
+      environment_name:
+        description: "Enter Power Platform Environment Name"
+        required: true
+        type: string
+permissions:
+  id-token: write
+  contents: read
+jobs:
+  delete-ude:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+      # Install PAC CLI
+      - name: Install PAC CLI
+        run: |
+          dotnet tool install --global Microsoft.PowerApps.CLI.Tool
+          echo "$HOME/.dotnet/tools" >> $GITHUB_PATH
+      # Verify PAC CLI
+      - name: Verify PAC CLI
+        shell: bash
+        run: |
+          echo "PATH=$PATH"
+          which pac
+          pac help
+      # Authenticate PAC CLI using GitHub Federated Identity (OIDC, no secrets)
+      - name: Authenticate PAC CLI
+        shell: bash
+        run: |
+          pac auth create \
+            --githubFederated \
+            --applicationId "${{ secrets.CLIENT_ID }}" \
+            --tenant "${{ secrets.PP_TENANT_ID }}" \
+            --cloud Public
+          echo "Active PAC auth profiles:"
+          pac auth list
+      # Resolve Environment ID from Environment Name
+      - name: Resolve Environment ID
+        id: resolve-env
+        shell: bash
+        run: |
+          ENV_NAME="${{ github.event.inputs.environment_name }}"
+          ENV_NAME_LC=$(echo "$ENV_NAME" | tr '[:upper:]' '[:lower:]')
+          echo "Searching for environment name: $ENV_NAME"
+          pac admin list --name "$ENV_NAME" --json > envs.json
+          echo "Raw environment list response:"
+          cat envs.json
+          ENV_ID=$(jq -r '
+            .[]?
+            | select(
+                (
+                  (.DisplayName // .displayName // .name // .properties.displayName // "")
+                  | ascii_downcase
+                ) == "'"$ENV_NAME_LC"'"
+              )
+            | (.EnvironmentId // .environmentId // .id // empty)
+          ' envs.json | head -n 1)
+          if [ -z "$ENV_ID" ] || [ "$ENV_ID" = "null" ]; then
+            echo "Environment not found: $ENV_NAME"
+            echo "Returned environments:"
+            jq -r '
+              .[]?
+              | (.DisplayName // .displayName // .name // .properties.displayName // "UNKNOWN")
+            ' envs.json
+            exit 1
+          fi
+          echo "Resolved Environment ID: $ENV_ID"
+          echo "environment_id=$ENV_ID" >> "$GITHUB_OUTPUT"
+      # Delete Environment
+      - name: Delete UDE environment using PAC CLI
+        shell: bash
+        run: |
+          ENV_ID="${{ steps.resolve-env.outputs.environment_id }}"
+          echo "Deleting environment ID: $ENV_ID"
+          pac admin delete \
+            --environment "$ENV_ID" \
+            --async \
+            --max-async-wait-time 90
