@@ -42,7 +42,7 @@ jobs:
           dotnet tool install --global Microsoft.PowerApps.CLI.Tool
 
           echo "$HOME/.dotnet/tools" >> $GITHUB_PATH
-          JSON_FILE="$GITHUB_WORKSPACE/**/ce-prerequisites.json"
+          JSON_FILE="$GITHUB_WORKSPACE/*/ce-prerequisites.json"
           echo "Checking JSON file: $JSON_FILE"
           if [ ! -f "$JSON_FILE" ]; then
             echo "ERROR: JSON file not found: $JSON_FILE"
