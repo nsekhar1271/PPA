@@ -42,7 +42,13 @@ jobs:
           dotnet tool install --global Microsoft.PowerApps.CLI.Tool
 
           echo "$HOME/.dotnet/tools" >> $GITHUB_PATH
-
+          JSON_FILE="$GITHUB_WORKSPACE/.github/workflows/ce-prerequisites.json"
+          echo "Checking JSON file: $JSON_FILE"
+          if [ ! -f "$JSON_FILE" ]; then
+            echo "ERROR: JSON file not found: $JSON_FILE"
+            exit 1
+          fi
+           echo "JSON file found successfully: $JSON_FILE"
       # Verify PAC CLI
       - name: Verify PAC CLI
         run: |
