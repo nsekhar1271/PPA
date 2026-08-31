@@ -1,0 +1,432 @@
+name: Install CE Prerequisites
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment_name:
+        description: Enter Power Platform Environment Name
+        required: true
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  install-applications:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install jq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+      - name: Install PAC CLI
+        run: |
+          dotnet tool install --global Microsoft.PowerApps.CLI.Tool
+          echo "$HOME/.dotnet/tools" >> "$GITHUB_PATH"
+
+      - name: Verify PAC CLI
+        run: |
+          pac help
+
+      - name: Authenticate PAC
+        run: |
+          pac auth create \
+            --applicationId "${{ secrets.CLIENT_ID }}" \
+            --tenant "${{ secrets.PP_TENANT_ID }}" \
+            --githubFederated
+
+      - name: Verify PAC Authentication
+        run: |
+          pac auth list
+
+      - name: Resolve Environment ID
+        id: resolve-env
+        shell: bash
+        run: |
+          ENV_NAME="${{ github.event.inputs.environment_name }}"
+          ENV_NAME_LC=$(echo "$ENV_NAME" | tr '[:upper:]' '[:lower:]')
+
+          echo "Searching environment: $ENV_NAME"
+
+          pac admin list --json > envs.json
+
+          ENV_ID=$(jq -r --arg envNameLc "$ENV_NAME_LC" '
+            (
+              if type == "array" then
+                .
+              elif type == "object" and has("value") then
+                .value
+              else
+                []
+              end
+            )
+            | map(
+                select(
+                  (
+                    (.DisplayName // .displayName // .name // .Name // "")
+                    | ascii_downcase
+                  ) == $envNameLc
+                  or
+                  (
+                    (.DisplayName // .displayName // .name // .Name // "")
+                    | ascii_downcase
+                    | contains($envNameLc)
+                  )
+                )
+              )
+            | .[0]
+            | (.EnvironmentId // .environmentId // .id // .Id // empty)
+          ' envs.json)
+
+          if [ -z "$ENV_ID" ] || [ "$ENV_ID" = "null" ]; then
+            echo "ERROR: Environment not found"
+            exit 1
+          fi
+
+          echo "Resolved Environment ID: $ENV_ID"
+          echo "environment_id=$ENV_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Validate JSON File
+        shell: bash
+        run: |
+          JSON_FILE="$GITHUB_WORKSPACE/ce-prerequisites.json"
+
+          if [ ! -f "$JSON_FILE" ]; then
+            echo "ERROR: ce-prerequisites.json not found"
+            ls -R
+            exit 1
+          fi
+
+          jq empty "$JSON_FILE"
+
+          if ! jq -e 'type == "array"' "$JSON_FILE" > /dev/null; then
+            echo "ERROR: JSON root must be an array"
+            exit 1
+          fi
+
+          INVALID_COUNT=$(jq '
+            [
+              .[]
+              | select(
+                  (.FriendlyName == null or .FriendlyName == "") or
+                  (.ApplicationId == null or .ApplicationId == "") or
+                  (.UniqueName == null or .UniqueName == "")
+                )
+            ] | length
+          ' "$JSON_FILE")
+
+          if [ "$INVALID_COUNT" -gt 0 ]; then
+            echo "ERROR: Invalid entries found in JSON"
+            jq '
+              .[]
+              | select(
+                  (.FriendlyName == null or .FriendlyName == "") or
+                  (.ApplicationId == null or .ApplicationId == "") or
+                  (.UniqueName == null or .UniqueName == "")
+                )
+            ' "$JSON_FILE"
+
+            exit 1
+          fi
+
+          echo "JSON validation successful"
+
+      - name: Install CE Applications
+        shell: bash
+        run: |
+          ENV_ID="${{ steps.resolve-env.outputs.environment_id }}"
+          JSON_FILE="$GITHUB_WORKSPACE/ce-prerequisites.json"
+
+          RESULTS_FILE="$RUNNER_TEMP/application-results.tsv"
+          HISTORY_FILE="$RUNNER_TEMP/application-history.txt"
+
+          > "$RESULTS_FILE"
+          > "$HISTORY_FILE"
+
+          TOTAL=0
+          SUCCESS=0
+          ALREADY_INSTALLED=0
+          FAILED=0
+          TIMEOUT=0
+          ERROR=0
+
+          while IFS= read -r app
+          do
+            TOTAL=$((TOTAL + 1))
+
+            FRIENDLY_NAME=$(echo "$app" | jq -r '.FriendlyName')
+            APPLICATION_ID=$(echo "$app" | jq -r '.ApplicationId')
+            UNIQUE_NAME=$(echo "$app" | jq -r '.UniqueName')
+
+            echo ""
+            echo "=================================================="
+            echo "Installing: $FRIENDLY_NAME"
+            echo "Application ID: $APPLICATION_ID"
+            echo "Unique Name: $UNIQUE_NAME"
+            echo "=================================================="
+
+            {
+              echo ""
+              echo "============================================================"
+              echo "APPLICATION: $FRIENDLY_NAME"
+              echo "APPLICATION ID: $APPLICATION_ID"
+              echo "UNIQUE NAME: $UNIQUE_NAME"
+              echo "============================================================"
+            } >> "$HISTORY_FILE"
+
+            if [ -z "$UNIQUE_NAME" ] || [ "$UNIQUE_NAME" = "null" ]; then
+              echo "ERROR: Unique Name missing"
+
+              {
+                echo "FINAL RESULT: ERROR"
+                echo "Reason: Unique Name missing"
+              } >> "$HISTORY_FILE"
+
+              ERROR=$((ERROR + 1))
+
+              printf '%s\t%s\t%s\t%s\n' \
+                "$FRIENDLY_NAME" \
+                "$APPLICATION_ID" \
+                "$UNIQUE_NAME" \
+                "ERROR - Unique Name missing" >> "$RESULTS_FILE"
+
+              continue
+            fi
+
+            MAX_RETRIES=10
+            RETRY_COUNT=0
+            FINAL_STATUS="FAILED"
+
+            while [ $RETRY_COUNT -lt $MAX_RETRIES ]
+            do
+              ATTEMPT=$((RETRY_COUNT + 1))
+
+              echo ""
+              echo "Attempt $ATTEMPT of $MAX_RETRIES"
+
+              {
+                echo ""
+                echo "----- Attempt $ATTEMPT of $MAX_RETRIES -----"
+                echo "Started: $(date '+%Y-%m-%d %H:%M:%S')"
+              } >> "$HISTORY_FILE"
+
+              set +e
+
+              PAC_OUTPUT=$(timeout 15m pac application install \
+                --environment "$ENV_ID" \
+                --application-name "$UNIQUE_NAME" 2>&1)
+
+              EXIT_CODE=$?
+
+              set -e
+
+              echo "$PAC_OUTPUT"
+
+              {
+                echo "Exit Code: $EXIT_CODE"
+                echo "PAC Output:"
+                echo "$PAC_OUTPUT"
+                echo "Finished: $(date '+%Y-%m-%d %H:%M:%S')"
+              } >> "$HISTORY_FILE"
+
+              # SUCCESS
+              if [ $EXIT_CODE -eq 0 ]; then
+                echo "SUCCESS: $FRIENDLY_NAME"
+
+                echo "FINAL RESULT: SUCCESS" >> "$HISTORY_FILE"
+
+                SUCCESS=$((SUCCESS + 1))
+                FINAL_STATUS="SUCCESS"
+
+                printf '%s\t%s\t%s\t%s\n' \
+                  "$FRIENDLY_NAME" \
+                  "$APPLICATION_ID" \
+                  "$UNIQUE_NAME" \
+                  "SUCCESS" >> "$RESULTS_FILE"
+
+                break
+              fi
+
+              # ALREADY INSTALLED
+              if echo "$PAC_OUTPUT" | grep -Eiq \
+                "already installed|already exists|is already installed|application is already installed"; then
+
+                echo "ALREADY INSTALLED: $FRIENDLY_NAME"
+
+                echo "FINAL RESULT: ALREADY INSTALLED" >> "$HISTORY_FILE"
+
+                ALREADY_INSTALLED=$((ALREADY_INSTALLED + 1))
+                FINAL_STATUS="ALREADY INSTALLED"
+
+                printf '%s\t%s\t%s\t%s\n' \
+                  "$FRIENDLY_NAME" \
+                  "$APPLICATION_ID" \
+                  "$UNIQUE_NAME" \
+                  "ALREADY INSTALLED" >> "$RESULTS_FILE"
+
+                break
+              fi
+
+              # TIMEOUT
+              if [ $EXIT_CODE -eq 124 ]; then
+                echo "TIMEOUT: $FRIENDLY_NAME"
+
+                {
+                  echo "FINAL RESULT: TIMEOUT"
+                  echo "Reason: PAC command exceeded 15 minutes"
+                } >> "$HISTORY_FILE"
+
+                TIMEOUT=$((TIMEOUT + 1))
+                FINAL_STATUS="TIMEOUT"
+
+                printf '%s\t%s\t%s\t%s\n' \
+                  "$FRIENDLY_NAME" \
+                  "$APPLICATION_ID" \
+                  "$UNIQUE_NAME" \
+                  "TIMEOUT" >> "$RESULTS_FILE"
+
+                break
+              fi
+
+              RETRY_COUNT=$((RETRY_COUNT + 1))
+
+              if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
+                echo "Attempt failed. Waiting 60 seconds..."
+                echo "Retrying..." >> "$HISTORY_FILE"
+                sleep 60
+              fi
+
+            done
+
+            # FINAL FAILURE
+            if [ "$FINAL_STATUS" = "FAILED" ]; then
+              echo "FAILED: $FRIENDLY_NAME"
+
+              {
+                echo ""
+                echo "FINAL RESULT: FAILED"
+                echo "Total Attempts: $MAX_RETRIES"
+              } >> "$HISTORY_FILE"
+
+              FAILED=$((FAILED + 1))
+
+              printf '%s\t%s\t%s\t%s\n' \
+                "$FRIENDLY_NAME" \
+                "$APPLICATION_ID" \
+                "$UNIQUE_NAME" \
+                "FAILED" >> "$RESULTS_FILE"
+            fi
+
+          done < <(jq -c '.[]' "$JSON_FILE")
+
+
+          # ==================================================
+          # FINAL SUMMARY
+          # ==================================================
+
+          echo ""
+          echo "=========================================================="
+          echo "        CE APPLICATION INSTALLATION REPORT"
+          echo "=========================================================="
+
+          cat "$RESULTS_FILE"
+
+          echo ""
+          echo "Total Applications : $TOTAL"
+          echo "Successful          : $SUCCESS"
+          echo "Already Installed   : $ALREADY_INSTALLED"
+          echo "Failed              : $FAILED"
+          echo "Timeout             : $TIMEOUT"
+          echo "Errors              : $ERROR"
+
+
+          # ==================================================
+          # GITHUB SUMMARY
+          # ==================================================
+
+          echo "# CE Application Installation Report" >> "$GITHUB_STEP_SUMMARY"
+
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
+          echo "| Application | Application ID | Unique Name | Status |" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+          echo "|---|---|---|---|" >> "$GITHUB_STEP_SUMMARY"
+
+          while IFS=$'\t' read -r NAME APP_ID UNIQUE STATUS
+          do
+            case "$STATUS" in
+              SUCCESS)
+                ICON="✅"
+                ;;
+              ALREADY\ INSTALLED)
+                ICON="⚠️"
+                ;;
+              TIMEOUT)
+                ICON="⏱️"
+                ;;
+              FAILED)
+                ICON="❌"
+                ;;
+              ERROR*)
+                ICON="❌"
+                ;;
+              *)
+                ICON="❓"
+                ;;
+            esac
+
+            echo "| $NAME | $APP_ID | $UNIQUE | $ICON $STATUS |" \
+              >> "$GITHUB_STEP_SUMMARY"
+
+          done < "$RESULTS_FILE"
+
+
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Summary" >> "$GITHUB_STEP_SUMMARY"
+
+          echo "| Result | Count |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---:|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Total | $TOTAL |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| ✅ Successful | $SUCCESS |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| ⚠️ Already Installed | $ALREADY_INSTALLED |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| ❌ Failed | $FAILED |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| ⏱️ Timeout | $TIMEOUT |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| ❌ Errors | $ERROR |" >> "$GITHUB_STEP_SUMMARY"
+
+
+          # ==================================================
+          # FULL FAILURE / ATTEMPT HISTORY
+          # ==================================================
+
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Installation History" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo '```text' >> "$GITHUB_STEP_SUMMARY"
+          cat "$HISTORY_FILE" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+
+          # ==================================================
+          # FAIL WORKFLOW ONLY AFTER EVERYTHING IS PROCESSED
+          # ==================================================
+
+          if [ "$FAILED" -gt 0 ] || \
+             [ "$TIMEOUT" -gt 0 ] || \
+             [ "$ERROR" -gt 0 ]; then
+
+            echo ""
+            echo "Some applications failed."
+            echo "All applications have been processed."
+
+            exit 1
+          fi
+
+          echo ""
+          echo "All applications processed successfully."
