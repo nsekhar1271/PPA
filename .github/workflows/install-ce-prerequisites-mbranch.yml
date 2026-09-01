@@ -1,0 +1,411 @@
+name: Install CE Prerequisites mbranch
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment_name:
+        description: Enter Power Platform Environment Name
+        required: true
+        type: string
+
+  push:
+    branches:
+      - dev
+      - 'feature/**'
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  install-applications:
+
+    runs-on: ubuntu-latest
+
+    # Select GitHub Environment based on branch
+    environment:
+      name: ${{ github.ref_name == 'main' && 'production' || 'development' }}
+
+    steps:
+
+      # ---------------------------------------------------------
+      # Checkout repository
+      # ---------------------------------------------------------
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      # ---------------------------------------------------------
+      # Debug repository structure
+      # ---------------------------------------------------------
+      - name: Debug Repository Files
+        run: |
+          echo "===================================="
+          echo "Current directory"
+          echo "===================================="
+          pwd
+
+          echo ""
+          echo "===================================="
+          echo "Repository files"
+          echo "===================================="
+          ls -R
+
+          echo ""
+          echo "===================================="
+          echo "GitHub branch information"
+          echo "===================================="
+          echo "GITHUB_REF       = $GITHUB_REF"
+          echo "GITHUB_REF_NAME  = $GITHUB_REF_NAME"
+          echo "GITHUB_EVENT_NAME = $GITHUB_EVENT_NAME"
+
+      # ---------------------------------------------------------
+      # Install jq
+      # ---------------------------------------------------------
+      - name: Install jq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+      # ---------------------------------------------------------
+      # Install Power Platform CLI
+      # ---------------------------------------------------------
+      - name: Install PAC CLI
+        run: |
+          dotnet tool install --global Microsoft.PowerApps.CLI.Tool
+
+          echo "$HOME/.dotnet/tools" >> "$GITHUB_PATH"
+
+      # ---------------------------------------------------------
+      # Verify PAC CLI
+      # ---------------------------------------------------------
+      - name: Verify PAC CLI
+        run: |
+          pac help
+
+      # ---------------------------------------------------------
+      # Display selected GitHub Environment
+      # ---------------------------------------------------------
+      - name: Display Deployment Environment
+        run: |
+          echo "===================================="
+          echo "Deployment Information"
+          echo "===================================="
+
+          if [ "$GITHUB_REF_NAME" = "main" ]; then
+            echo "Git branch       : $GITHUB_REF_NAME"
+            echo "GitHub Environment: production"
+          else
+            echo "Git branch       : $GITHUB_REF_NAME"
+            echo "GitHub Environment: development"
+          fi
+
+      # ---------------------------------------------------------
+      # Authenticate PAC using GitHub OIDC
+      # ---------------------------------------------------------
+      - name: Authenticate PAC
+        run: |
+          echo "Authenticating Power Platform CLI using GitHub OIDC..."
+
+          pac auth create \
+            --applicationId "${{ secrets.CLIENT_ID }}" \
+            --tenant "${{ secrets.PP_TENANT_ID }}" \
+            --githubFederated
+
+      # ---------------------------------------------------------
+      # Verify authentication
+      # ---------------------------------------------------------
+      - name: Verify PAC Authentication
+        run: |
+          echo "===================================="
+          echo "PAC Authentication"
+          echo "===================================="
+
+          pac auth list
+
+      # ---------------------------------------------------------
+      # Resolve Power Platform Environment ID
+      # ---------------------------------------------------------
+      - name: Resolve Environment ID
+        id: resolve-env
+        shell: bash
+        run: |
+
+          ENV_NAME="${{ github.event.inputs.environment_name }}"
+
+          if [ -z "$ENV_NAME" ]; then
+            echo "ERROR: environment_name input is required"
+            exit 1
+          fi
+
+          ENV_NAME_LC=$(echo "$ENV_NAME" | tr '[:upper:]' '[:lower:]')
+
+          echo "===================================="
+          echo "Searching Power Platform Environment"
+          echo "===================================="
+          echo "Environment Name: $ENV_NAME"
+
+          pac admin list --json > envs.json
+
+          echo ""
+          echo "Power Platform environments returned by PAC:"
+          cat envs.json
+
+          ENV_ID=$(jq -r --arg envNameLc "$ENV_NAME_LC" '
+            (
+              if type == "array" then
+                .
+              elif type == "object" and has("value") then
+                .value
+              else
+                []
+              end
+            )
+            |
+            map(
+              select(
+                (
+                  (.DisplayName // .displayName // .name // .Name // "")
+                  | ascii_downcase
+                ) == $envNameLc
+                or
+                (
+                  (.DisplayName // .displayName // .name // .Name // "")
+                  | ascii_downcase
+                  | contains($envNameLc)
+                )
+              )
+            )
+            |
+            .[0]
+            |
+            (.EnvironmentId // .environmentId // .id // .Id // empty)
+          ' envs.json)
+
+          if [ -z "$ENV_ID" ] || [ "$ENV_ID" = "null" ]; then
+            echo ""
+            echo "ERROR: Power Platform Environment not found"
+            echo "Environment Name: $ENV_NAME"
+            exit 1
+          fi
+
+          echo ""
+          echo "===================================="
+          echo "Environment Found"
+          echo "===================================="
+          echo "Environment ID: $ENV_ID"
+
+          echo "environment_id=$ENV_ID" >> "$GITHUB_OUTPUT"
+
+      # ---------------------------------------------------------
+      # Validate CE prerequisites JSON
+      # ---------------------------------------------------------
+      - name: Validate JSON File
+        shell: bash
+        run: |
+
+          JSON_FILE="$GITHUB_WORKSPACE/.github/workflows/ce-prerequisites.json"
+
+          echo "===================================="
+          echo "Validating CE prerequisites JSON"
+          echo "===================================="
+
+          echo "Checking JSON file:"
+          echo "$JSON_FILE"
+
+          if [ ! -f "$JSON_FILE" ]; then
+
+            echo ""
+            echo "ERROR: ce-prerequisites.json not found"
+
+            echo ""
+            echo "Repository contents:"
+            ls -R
+
+            exit 1
+          fi
+
+          # Validate JSON syntax
+          if ! jq empty "$JSON_FILE"; then
+            echo "ERROR: Invalid JSON syntax"
+            exit 1
+          fi
+
+          echo "JSON syntax is valid"
+
+          # Validate root is an array
+          if ! jq -e 'type == "array"' "$JSON_FILE" > /dev/null; then
+            echo "ERROR: JSON root must be an array"
+            exit 1
+          fi
+
+          # Validate required properties
+          INVALID_COUNT=$(jq '
+            [
+              .[]
+              |
+              select(
+                (.FriendlyName == null or .FriendlyName == "") or
+                (.ApplicationId == null or .ApplicationId == "") or
+                (.UniqueName == null or .UniqueName == "")
+              )
+            ]
+            |
+            length
+          ' "$JSON_FILE")
+
+          if [ "$INVALID_COUNT" -gt 0 ]; then
+
+            echo "ERROR: Invalid entries found in JSON"
+
+            jq '
+              .[]
+              |
+              select(
+                (.FriendlyName == null or .FriendlyName == "") or
+                (.ApplicationId == null or .ApplicationId == "") or
+                (.UniqueName == null or .UniqueName == "")
+              )
+            ' "$JSON_FILE"
+
+            exit 1
+          fi
+
+          echo ""
+          echo "JSON validation successful"
+
+          echo ""
+          echo "Applications to install:"
+          jq -r '
+            .[]
+            |
+            "\(.FriendlyName) | \(.ApplicationId) | \(.UniqueName)"
+          ' "$JSON_FILE"
+
+      # ---------------------------------------------------------
+      # Install CE Applications
+      # ---------------------------------------------------------
+      - name: Install CE Applications
+        shell: bash
+        run: |
+
+          ENV_ID="${{ steps.resolve-env.outputs.environment_id }}"
+          JSON_FILE="$GITHUB_WORKSPACE/.github/workflows/ce-prerequisites.json"
+
+          echo "===================================="
+          echo "Installing CE Applications"
+          echo "===================================="
+
+          echo "Power Platform Environment ID:"
+          echo "$ENV_ID"
+
+          echo ""
+
+          FAILURES=0
+
+          while IFS= read -r app
+          do
+
+            FRIENDLY_NAME=$(echo "$app" | jq -r '.FriendlyName')
+            APPLICATION_ID=$(echo "$app" | jq -r '.ApplicationId')
+            UNIQUE_NAME=$(echo "$app" | jq -r '.UniqueName')
+
+            echo "===================================="
+            echo "Installing Application"
+            echo "===================================="
+            echo "Friendly Name : $FRIENDLY_NAME"
+            echo "Application ID: $APPLICATION_ID"
+            echo "Unique Name   : $UNIQUE_NAME"
+            echo "Environment ID: $ENV_ID"
+            echo "===================================="
+
+            if [ -z "$UNIQUE_NAME" ] || [ "$UNIQUE_NAME" = "null" ]; then
+
+              echo "ERROR: Unique Name missing for $FRIENDLY_NAME"
+
+              FAILURES=$((FAILURES + 1))
+
+              continue
+
+            fi
+
+            MAX_RETRIES=10
+            RETRY_COUNT=0
+            INSTALL_SUCCESS=false
+
+            while [ "$RETRY_COUNT" -lt "$MAX_RETRIES" ]
+            do
+
+              echo ""
+              echo "Attempt $((RETRY_COUNT + 1)) of $MAX_RETRIES"
+
+              set +e
+
+              pac application install \
+                --environment "$ENV_ID" \
+                --application-name "$UNIQUE_NAME"
+
+              EXIT_CODE=$?
+
+              set -e
+
+              if [ "$EXIT_CODE" -eq 0 ]; then
+
+                echo ""
+                echo "SUCCESS: $FRIENDLY_NAME installed"
+
+                INSTALL_SUCCESS=true
+
+                break
+
+              fi
+
+              echo ""
+              echo "Installation failed."
+              echo "Exit code: $EXIT_CODE"
+
+              RETRY_COUNT=$((RETRY_COUNT + 1))
+
+              if [ "$RETRY_COUNT" -lt "$MAX_RETRIES" ]; then
+
+                echo "Environment may not be fully enabled yet."
+                echo "Waiting 60 seconds before retry..."
+
+                sleep 60
+
+              fi
+
+            done
+
+            if [ "$INSTALL_SUCCESS" = false ]; then
+
+              echo ""
+              echo "FAILED: $FRIENDLY_NAME after $MAX_RETRIES attempts"
+
+              FAILURES=$((FAILURES + 1))
+
+            fi
+
+            echo ""
+
+          done < <(jq -c '.[]' "$JSON_FILE")
+
+          # -----------------------------------------------------
+          # Final result
+          # -----------------------------------------------------
+
+          if [ "$FAILURES" -gt 0 ]; then
+
+            echo "===================================="
+            echo "INSTALLATION FAILED"
+            echo "===================================="
+
+            echo "Number of failed applications: $FAILURES"
+
+            exit 1
+
+          fi
+
+          echo "===================================="
+          echo "ALL APPLICATIONS INSTALLED"
+          echo "SUCCESSFULLY"
+          echo "===================================="
