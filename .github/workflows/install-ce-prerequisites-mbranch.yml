@@ -1,4 +1,4 @@
-name: Install CE Prerequisites
+name: Install CE Prerequisites mbranch
 
 on:
   workflow_dispatch:
