@@ -25,7 +25,7 @@ jobs:
 
     # Select GitHub Environment based on branch
     environment:
-      name: ${{ github.ref_name == 'main' || 'production' || 'development' }}
+      name: ${{ github.ref_name == 'main' && 'production' || 'development' }}
 
     steps:
 
